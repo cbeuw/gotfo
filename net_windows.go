@@ -46,30 +46,30 @@ func (l *TFOListener) Accept() (net.Conn, error) {
 	return l.AcceptTCP()
 }
 
-func Dial(address string, data []byte) (*net.TCPConn, error) {
-	return DialContext(context.Background(), address, data)
+func Dial(address string, fastOpen bool, data []byte) (*net.TCPConn, error) {
+	return DialContext(context.Background(), address, fastOpen, data)
 }
 
-func DialContext(ctx context.Context, address string, data []byte) (*net.TCPConn, error) {
+func DialContext(ctx context.Context, address string, fastOpen bool, data []byte) (*net.TCPConn, error) {
 	raddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
 		return nil, err
 	}
 
-	if fd, err := socket(ctx, syscall.AF_INET, false, raddr, true, data); err != nil {
+	if fd, err := socket(ctx, syscall.AF_INET, false, raddr, true, fastOpen, data); err != nil {
 		return nil, err
 	} else {
 		return newTCPConn(fd), nil
 	}
 }
 
-func Listen(address string) (net.Listener, error) {
+func Listen(address string, fastOpen bool) (net.Listener, error) {
 	laddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
 		return nil, err
 	}
 
-	if fd, err := socket(context.Background(), syscall.AF_INET, false, laddr, false, nil); err != nil {
+	if fd, err := socket(context.Background(), syscall.AF_INET, false, laddr, false, fastOpen, nil); err != nil {
 		return nil, err
 	} else {
 		return newTCPListener(fd, true), nil

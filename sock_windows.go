@@ -13,7 +13,7 @@ import (
 
 // socket returns a network file descriptor that is ready for
 // asynchronous I/O using the network poller.
-func socket(ctx context.Context, family int, ipv6only bool, addr *net.TCPAddr, dial bool, data []byte) (fd *netFD, err error) {
+func socket(ctx context.Context, family int, ipv6only bool, addr *net.TCPAddr, dial bool, fastOpen bool, data []byte) (fd *netFD, err error) {
 	syscall.ForkLock.RLock()
 	s, err := syscall.Socket(family, syscall.SOCK_STREAM, 0)
 	if err == nil {
@@ -37,7 +37,9 @@ func socket(ctx context.Context, family int, ipv6only bool, addr *net.TCPAddr, d
 
 		syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
 
-		syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, TCP_FASTOPEN, 1)
+		if fastOpen {
+			syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, TCP_FASTOPEN, 1)
+		}
 
 		if err := fd.dial(ctx, addr, data); err != nil {
 			fd.Close()
