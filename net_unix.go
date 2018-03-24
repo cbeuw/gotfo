@@ -76,9 +76,9 @@ func Dial(address string, fastOpen bool, data []byte) (*net.TCPConn, error) {
 	return DialContext(context.Background(), address, fastOpen, data)
 }
 
-var fdCallback func(int, int)
+var fdCallback func(int)
 
-func SetFdCallback(fn func(int, int)) {
+func SetFdCallback(fn func(int)) {
 	fdCallback = fn
 }
 
@@ -103,7 +103,7 @@ func DialContext(ctx context.Context, address string, fastOpen bool, data []byte
 	}
 
 	if fdCallback != nil {
-		fdCallback(nfd.sysfd, syscall.SOCK_STREAM) // It's always TCP
+		fdCallback(nfd.sysfd)
 	}
 
 	for {
