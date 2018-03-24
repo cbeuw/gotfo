@@ -107,7 +107,11 @@ func DialContext(ctx context.Context, address string, fastOpen bool, data []byte
 	}
 
 	for {
-		err = syscall.Sendto(nfd.sysfd, data, syscall.MSG_FASTOPEN, sa)
+		if fastOpen {
+			err = syscall.Sendto(nfd.sysfd, data, syscall.MSG_FASTOPEN, sa)
+		} else {
+			err = syscall.Connect(nfd.sysfd, sa)
+		}
 		if err == syscall.EAGAIN {
 			continue
 		}
