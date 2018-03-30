@@ -106,10 +106,12 @@ func setDeadlineImpl(fd *netFD, t time.Time, mode int) error {
 	if err := fd.incref(); err != nil {
 		return err
 	}
+
+	// https://github.com/golang/go/commit/3813f941f6ff80f64d14db35f8b6446e10e45411#diff-2fac41fb57b6d5728ad14f6115f7219b
+	defer fd.decref()
 	if fd.pd.runtimeCtx == 0 {
 		return errors.New("file type does not support deadlines")
 	}
 	runtime_pollSetDeadline(fd.pd.runtimeCtx, d, mode)
-	fd.decref()
 	return nil
 }

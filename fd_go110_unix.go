@@ -1,6 +1,7 @@
-// +build go1.9,!go1.10
+// +build go1.10
 // +build darwin dragonfly freebsd linux nacl netbsd openbsd solaris
 
+// https://github.com/golang/go/commit/382d4928b8a758a91f06de9e6cb10b92bb882eff
 package gotfo
 
 import "syscall"
@@ -19,6 +20,9 @@ type pollFD struct {
 	// Writev cache.
 	iovecs *[]syscall.Iovec
 
+	// Semaphore signaled when file is closed.
+	csema uint32
+
 	// Whether this is a streaming descriptor, as opposed to a
 	// packet-based descriptor like a UDP socket. Immutable.
 	IsStream bool
@@ -29,6 +33,9 @@ type pollFD struct {
 
 	// Whether this is a file rather than a network socket.
 	isFile bool
+
+	// Whether this file has been set to blocking mode.
+	isBlocking bool
 }
 
 // Network file descriptor.
@@ -88,6 +95,36 @@ func (fd *pollFD) destroy() error {
 	fd.pd.close()
 	err := syscall.Close(fd.sysfd)
 	fd.sysfd = -1
+	runtime_Semrelease(&fd.csema)
+	return err
+}
+
+// Close closes the FD. The underlying file descriptor is closed by the
+// destroy method when there are no remaining references.
+func (fd *pollFD) Close() error {
+	if !fd.fdmu.increfAndClose() {
+		return errClosing
+	}
+
+	// Unblock any I/O.  Once it all unblocks and returns,
+	// so that it cannot be referring to fd.sysfd anymore,
+	// the final decref will close fd.sysfd. This should happen
+	// fairly quickly, since all the I/O is non-blocking, and any
+	// attempts to block in the pollDesc will return errClosing(fd.isFile).
+	fd.pd.evict()
+
+	// The call to decref will call destroy if there are no other
+	// references.
+	err := fd.decref()
+
+	// Wait until the descriptor is closed. If this was the only
+	// reference, it is already closed. Only wait if the file has
+	// not been set to blocking mode, as otherwise any current I/O
+	// may be blocking, and that would block the Close.
+	if !fd.isBlocking {
+		runtime_Semacquire(&fd.csema)
+	}
+
 	return err
 }
 
