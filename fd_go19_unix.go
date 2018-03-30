@@ -53,7 +53,7 @@ func newFD(fd int) *netFD {
 		},
 		family: syscall.AF_INET,
 		sotype: syscall.SOCK_STREAM,
-		net:    "tcp4",
+		net:    "tcp",
 	}
 
 	return nfd
