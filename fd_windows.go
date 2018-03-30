@@ -6,6 +6,7 @@ package gotfo
 
 import (
 	"context"
+	"github.com/cbeuw/gotfo/internal/poll"
 	"net"
 	"os"
 	"runtime"
@@ -13,106 +14,88 @@ import (
 	"unsafe"
 )
 
-// ExecIO executes a single IO operation o. It submits and cancels
-// IO in the current thread for systems where Windows CancelIoEx API
-// is available. Alternatively, it passes the request onto
-// runtime netpoll and waits for completion or cancels request.
-func ExecIO(o *operation, name string, submit func(o *operation) error) (int, error) {
-	fd := o.fd
-	// Notify runtime netpoll about starting IO.
-	err := fd.pd.prepare(int(o.mode))
-	if err != nil {
-		return 0, err
+// canUseConnectEx reports whether we can use the ConnectEx Windows API call
+// for the given network type.
+func canUseConnectEx(net string) bool {
+	switch net {
+	case "tcp", "tcp4", "tcp6":
+		return true
 	}
-	// Start IO.
-	err = submit(o)
-
-	switch err {
-	case nil:
-		// IO completed immediately
-		if o.fd.skipSyncNotif {
-			// No completion message will follow, so return immediately.
-			return int(o.qty), nil
-		}
-		// Need to get our completion message anyway.
-	case syscall.ERROR_IO_PENDING:
-		// IO started, and we have to wait for its completion.
-		err = nil
-	default:
-		return 0, err
-	}
-	// Wait for our request to complete.
-	err = fd.pd.wait(int(o.mode))
-	if err == nil {
-		// All is good. Extract our IO results and return.
-		if o.errno != 0 {
-			err = syscall.Errno(o.errno)
-			return 0, err
-		}
-		return int(o.qty), nil
-	}
-	// IO is interrupted by "close" or "timeout"
-	netpollErr := err
-	switch netpollErr {
-	case errClosing, errTimeout:
-		// will deal with those.
-	default:
-		panic("net: unexpected runtime.netpoll error: " + netpollErr.Error())
-	}
-	// Cancel our request.
-	err = syscall.CancelIoEx(fd.sysfd, &o.o)
-
-	// Assuming ERROR_NOT_FOUND is returned, if IO is completed.
-	if err != nil && err != syscall.ERROR_NOT_FOUND {
-		// TODO(brainman): maybe do something else, but panic.
-		panic(err)
-	}
-
-	// Wait for cancelation to complete.
-	fd.pd.waitCanceled(int(o.mode))
-	if o.errno != 0 {
-		err = syscall.Errno(o.errno)
-		if err == syscall.ERROR_OPERATION_ABORTED { // IO Canceled
-			err = netpollErr
-		}
-		return 0, err
-	}
-	// We issued a cancelation request. But, it seems, IO operation succeeded
-	// before the cancelation request run. We need to treat the IO operation as
-	// succeeded (the bytes are actually sent/recv from network).
-	return int(o.qty), nil
+	// ConnectEx windows API does not support connectionless sockets.
+	return false
 }
 
-func (fd *netFD) connect(ctx context.Context, ra syscall.Sockaddr, data []byte) error {
+// Network file descriptor.
+type netFD struct {
+	pfd poll.FD
+
+	// immutable until Close
+	family      int
+	sotype      int
+	isConnected bool
+	net         string
+	laddr       net.Addr
+	raddr       net.Addr
+}
+
+func newFD(sysfd syscall.Handle, family, sotype int, net string) (*netFD, error) {
+	ret := &netFD{
+		pfd: poll.FD{
+			Sysfd:         sysfd,
+			IsStream:      sotype == syscall.SOCK_STREAM,
+			ZeroReadIsEOF: sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW,
+		},
+		family: family,
+		sotype: sotype,
+		net:    net,
+	}
+	return ret, nil
+}
+
+func (fd *netFD) init() error {
+	errcall, err := fd.pfd.Init(fd.net, true)
+	if errcall != "" {
+		err = wrapSyscallError(errcall, err)
+	}
+	return err
+}
+
+func (fd *netFD) setAddr(laddr, raddr net.Addr) {
+	fd.laddr = laddr
+	fd.raddr = raddr
+	runtime.SetFinalizer(fd, (*netFD).Close)
+}
+
+// Always returns nil for connected peer address result.
+func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr, data []byte) (syscall.Sockaddr, error) {
 	// Do not need to call fd.writeLock here,
 	// because fd is not yet accessible to user,
 	// so no concurrent operations are possible.
 	if err := fd.init(); err != nil {
-		return err
+		return nil, err
 	}
 	if deadline, ok := ctx.Deadline(); ok && !deadline.IsZero() {
-		fd.SetWriteDeadline(deadline)
-		defer fd.SetWriteDeadline(noDeadline)
+		fd.pfd.SetWriteDeadline(deadline)
+		defer fd.pfd.SetWriteDeadline(noDeadline)
 	}
-
+	if !canUseConnectEx(fd.net) {
+		err := connectFunc(fd.pfd.Sysfd, ra)
+		return nil, os.NewSyscallError("connect", err)
+	}
 	// ConnectEx windows API requires an unconnected, previously bound socket.
-	var la syscall.Sockaddr
-
-	switch ra.(type) {
-	case *syscall.SockaddrInet4:
-		la = &syscall.SockaddrInet4{}
-	case *syscall.SockaddrInet6:
-		la = &syscall.SockaddrInet6{}
-	default:
-		panic("unexpected type in connect")
+	if la == nil {
+		switch ra.(type) {
+		case *syscall.SockaddrInet4:
+			la = &syscall.SockaddrInet4{}
+		case *syscall.SockaddrInet6:
+			la = &syscall.SockaddrInet6{}
+		default:
+			panic("unexpected type in connect")
+		}
+		if err := syscall.Bind(fd.pfd.Sysfd, la); err != nil {
+			return nil, os.NewSyscallError("bind", err)
+		}
 	}
-	if err := syscall.Bind(fd.sysfd, la); err != nil {
-		return os.NewSyscallError("bind", err)
-	}
-
-	// Call ConnectEx API.
-	o := &fd.wop
-	o.sa = ra
 
 	// Wait for the goroutine converting context.Done into a write timeout
 	// to exist, otherwise our caller might cancel the context and
@@ -124,47 +107,104 @@ func (fd *netFD) connect(ctx context.Context, ra syscall.Sockaddr, data []byte) 
 		case <-ctx.Done():
 			// Force the runtime's poller to immediately give
 			// up waiting for writability.
-			fd.SetWriteDeadline(aLongTimeAgo)
+			fd.pfd.SetWriteDeadline(aLongTimeAgo)
 			<-done
 		case <-done:
 		}
 	}()
 
-	_, err := ExecIO(o, "ConnectEx", func(o *operation) error {
-		if data != nil {
-			var bytesSend uint32
-			return syscall.ConnectEx(o.fd.sysfd, o.sa, &data[0], uint32(len(data)), &bytesSend, &o.o)
-		} else {
-			return syscall.ConnectEx(o.fd.sysfd, o.sa, nil, 0, nil, &o.o)
-		}
-	})
-
-	if err != nil {
+	// Call ConnectEx API.
+	if err := fd.pfd.ConnectEx(ra, data); err != nil {
 		select {
 		case <-ctx.Done():
-			return mapErr(ctx.Err())
+			return nil, mapErr(ctx.Err())
 		default:
 			if _, ok := err.(syscall.Errno); ok {
 				err = os.NewSyscallError("connectex", err)
 			}
-			return err
+			return nil, err
 		}
 	}
 	// Refresh socket properties.
-	return os.NewSyscallError("setsockopt", syscall.Setsockopt(fd.sysfd, syscall.SOL_SOCKET, syscall.SO_UPDATE_CONNECT_CONTEXT, (*byte)(unsafe.Pointer(&fd.sysfd)), int32(unsafe.Sizeof(fd.sysfd))))
+	return nil, os.NewSyscallError("setsockopt", syscall.Setsockopt(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_UPDATE_CONNECT_CONTEXT, (*byte)(unsafe.Pointer(&fd.pfd.Sysfd)), int32(unsafe.Sizeof(fd.pfd.Sysfd))))
 }
 
-func (fd *netFD) acceptOne(rawsa []syscall.RawSockaddrAny, o *operation) (*netFD, error) {
-	// Get new socket.
-	s, err := syscall.Socket(fd.family, fd.sotype, 0)
+func (fd *netFD) Close() error {
+	runtime.SetFinalizer(fd, nil)
+	return fd.pfd.Close()
+}
+
+func (fd *netFD) shutdown(how int) error {
+	err := fd.pfd.Shutdown(how)
+	runtime.KeepAlive(fd)
+	return err
+}
+
+func (fd *netFD) closeRead() error {
+	return fd.shutdown(syscall.SHUT_RD)
+}
+
+func (fd *netFD) closeWrite() error {
+	return fd.shutdown(syscall.SHUT_WR)
+}
+
+func (fd *netFD) Read(buf []byte) (int, error) {
+	n, err := fd.pfd.Read(buf)
+	runtime.KeepAlive(fd)
+	return n, wrapSyscallError("wsarecv", err)
+}
+
+func (fd *netFD) readFrom(buf []byte) (int, syscall.Sockaddr, error) {
+	n, sa, err := fd.pfd.ReadFrom(buf)
+	runtime.KeepAlive(fd)
+	return n, sa, wrapSyscallError("wsarecvfrom", err)
+}
+
+func (fd *netFD) Write(buf []byte) (int, error) {
+	n, err := fd.pfd.Write(buf)
+	runtime.KeepAlive(fd)
+	return n, wrapSyscallError("wsasend", err)
+}
+
+func (c *conn) writeBuffers(v *net.Buffers) (int64, error) {
+	if !c.ok() {
+		return 0, syscall.EINVAL
+	}
+	n, err := c.fd.writeBuffers(v)
 	if err != nil {
+		return n, &net.OpError{Op: "wsasend", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
+	return n, nil
+}
+
+func (fd *netFD) writeBuffers(buf *net.Buffers) (int64, error) {
+	n, err := fd.pfd.Writev((*[][]byte)(buf))
+	runtime.KeepAlive(fd)
+	return n, wrapSyscallError("wsasend", err)
+}
+
+func (fd *netFD) writeTo(buf []byte, sa syscall.Sockaddr) (int, error) {
+	n, err := fd.pfd.WriteTo(buf, sa)
+	runtime.KeepAlive(fd)
+	return n, wrapSyscallError("wsasendto", err)
+}
+
+func (fd *netFD) accept() (*netFD, error) {
+	s, rawsa, rsan, errcall, err := fd.pfd.Accept(func() (syscall.Handle, error) {
+		return sysSocket(fd.family, fd.sotype, 0)
+	})
+
+	if err != nil {
+		if errcall != "" {
+			err = wrapSyscallError(errcall, err)
+		}
 		return nil, err
 	}
 
 	// Associate our new socket with IOCP.
-	netfd, err := newFD(s, fd.family)
+	netfd, err := newFD(s, fd.family, fd.sotype, fd.net)
 	if err != nil {
-		syscall.Close(s)
+		poll.CloseFunc(s)
 		return nil, err
 	}
 	if err := netfd.init(); err != nil {
@@ -172,112 +212,33 @@ func (fd *netFD) acceptOne(rawsa []syscall.RawSockaddrAny, o *operation) (*netFD
 		return nil, err
 	}
 
-	// Submit accept request.
-	o.handle = s
-	o.rsan = int32(unsafe.Sizeof(rawsa[0]))
-	_, err = ExecIO(o, "AcceptEx", func(o *operation) error {
-		return syscall.AcceptEx(o.fd.sysfd, o.handle, (*byte)(unsafe.Pointer(&rawsa[0])), 0, uint32(o.rsan), uint32(o.rsan), &o.qty, &o.o)
-	})
-
-	if err != nil {
-		netfd.Close()
-		if _, ok := err.(syscall.Errno); ok {
-			err = os.NewSyscallError("acceptex", err)
-		}
-		return nil, err
-	}
-
-	// Inherit properties of the listening socket.
-	err = syscall.Setsockopt(s, syscall.SOL_SOCKET, syscall.SO_UPDATE_ACCEPT_CONTEXT, (*byte)(unsafe.Pointer(&fd.sysfd)), int32(unsafe.Sizeof(fd.sysfd)))
-	if err != nil {
-		netfd.Close()
-		return nil, os.NewSyscallError("setsockopt", err)
-	}
-	runtime.KeepAlive(fd)
-	return netfd, nil
-}
-
-func (fd *netFD) accept() (*netFD, error) {
-	if err := fd.readLock(); err != nil {
-		return nil, err
-	}
-	defer fd.readUnlock()
-
-	o := &fd.rop
-	var netfd *netFD
-	var err error
-	var rawsa [2]syscall.RawSockaddrAny
-	for {
-		netfd, err = fd.acceptOne(rawsa[:], o)
-		if err == nil {
-			break
-		}
-		// Sometimes we see WSAECONNRESET and ERROR_NETNAME_DELETED is
-		// returned here. These happen if connection reset is received
-		// before AcceptEx could complete. These errors relate to new
-		// connection, not to AcceptEx, so ignore broken connection and
-		// try AcceptEx again for more connections.
-		nerr, ok := err.(*os.SyscallError)
-		if !ok {
-			return nil, err
-		}
-		errno, ok := nerr.Err.(syscall.Errno)
-		if !ok {
-			return nil, err
-		}
-		switch errno {
-		case syscall.ERROR_NETNAME_DELETED, syscall.WSAECONNRESET:
-			// ignore these and try again
-		default:
-			return nil, err
-		}
-	}
-
 	// Get local and peer addr out of AcceptEx buffer.
 	var lrsa, rrsa *syscall.RawSockaddrAny
 	var llen, rlen int32
 	syscall.GetAcceptExSockaddrs((*byte)(unsafe.Pointer(&rawsa[0])),
-		0, uint32(o.rsan), uint32(o.rsan), &lrsa, &llen, &rrsa, &rlen)
+		0, rsan, rsan, &lrsa, &llen, &rrsa, &rlen)
 	lsa, _ := lrsa.Sockaddr()
 	rsa, _ := rrsa.Sockaddr()
 
-	netfd.setAddr(sockaddrToTCPAddr(lsa), sockaddrToTCPAddr(rsa))
+	netfd.setAddr(netfd.addrFunc()(lsa), netfd.addrFunc()(rsa))
 	return netfd, nil
 }
 
-func (fd *netFD) destroy() error {
-	if fd.sysfd == syscall.InvalidHandle {
-		return syscall.EINVAL
-	}
-	// Poller may want to unregister fd in readiness notification mechanism,
-	// so this must be executed before fd.syscall.Close.
-	fd.pd.close()
-
-	err := syscall.Close(fd.sysfd)
-	fd.sysfd = syscall.InvalidHandle
-	return err
+func (fd *netFD) readMsg(p []byte, oob []byte) (n, oobn, flags int, sa syscall.Sockaddr, err error) {
+	n, oobn, flags, sa, err = fd.pfd.ReadMsg(p, oob)
+	runtime.KeepAlive(fd)
+	return n, oobn, flags, sa, wrapSyscallError("wsarecvmsg", err)
 }
 
-func (fd *netFD) Close() error {
-	if !fd.fdmu.increfAndClose() {
-		return errClosing
-	}
-	// unblock pending reader and writer
-	fd.pd.evict()
-	fd.decref()
-	return nil
+func (fd *netFD) writeMsg(p []byte, oob []byte, sa syscall.Sockaddr) (n int, oobn int, err error) {
+	n, oobn, err = fd.pfd.WriteMsg(p, oob, sa)
+	runtime.KeepAlive(fd)
+	return n, oobn, wrapSyscallError("wsasendmsg", err)
 }
 
-func (fd *netFD) shutdown(how int) error {
-	if err := fd.incref(); err != nil {
-		return err
-	}
-	defer fd.decref()
-	return syscall.Shutdown(fd.sysfd, how)
-}
+// Unimplemented functions.
 
-func (fd *netFD) setAddr(laddr, raddr net.Addr) {
-	fd.laddr = laddr
-	fd.raddr = raddr
-	runtime.SetFinalizer(fd, (*netFD).Close)
+func (fd *netFD) dup() (*os.File, error) {
+	// TODO: Implement this
+	return nil, syscall.EWINDOWS
 }

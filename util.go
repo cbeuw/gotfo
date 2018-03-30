@@ -57,11 +57,6 @@ func newTCPConn(fd *netFD) *net.TCPConn {
 	dummyConn := &TCPConn{}
 	dummyConn.conn.fd = fd
 
-	if fd.incref() == nil {
-		syscall.SetsockoptInt(fd.sysfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-		fd.decref()
-	}
-
 	conn := (*net.TCPConn)(unsafe.Pointer(dummyConn))
 
 	return conn

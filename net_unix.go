@@ -27,12 +27,16 @@ func socket(family int, fastOpen bool) (int, error) {
 		return 0, err
 	}
 	if fastOpen {
-		if err := syscall.SetsockoptInt(fd, syscall.SOL_TCP, TCP_FASTOPEN, 1); err != nil {
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, TCP_FASTOPEN, 1); err != nil {
 			return 0, err
 		}
 	}
 
 	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		return 0, err
+	}
+
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
 		return 0, err
 	}
 
@@ -63,7 +67,7 @@ func Listen(address string, fastOpen bool) (net.Listener, error) {
 		return nil, err
 	}
 
-	nfd := newFD(fd)
+	nfd, _ := newFD(fd, syscall.AF_INET, syscall.SOCK_STREAM, "tcp")
 	if err := nfd.init(); err != nil {
 		syscall.Close(fd)
 		return nil, err
@@ -96,21 +100,23 @@ func DialContext(ctx context.Context, address string, fastOpen bool, data []byte
 
 	sa := tcpAddrToSockaddr(raddr)
 
-	nfd := newFD(fd)
+	nfd, _ := newFD(fd, syscall.AF_INET, syscall.SOCK_STREAM, "tcp")
 	if err := nfd.init(); err != nil {
 		syscall.Close(fd)
 		return nil, err
 	}
 
 	if fdCallback != nil {
-		fdCallback(nfd.sysfd)
+		fdCallback(nfd.pfd.Sysfd)
 	}
 
 	for {
 		if fastOpen {
-			err = syscall.Sendto(nfd.sysfd, data, syscall.MSG_FASTOPEN, sa)
+			// MSG_FASTOPEN=0x20000000
+			// syscall.MSG_FASTOPEN is not defined on mac
+			err = syscall.Sendto(nfd.pfd.Sysfd, data, 0x20000000, sa)
 		} else {
-			err = syscall.Connect(nfd.sysfd, sa)
+			err = syscall.Connect(nfd.pfd.Sysfd, sa)
 		}
 		if err == syscall.EAGAIN {
 			continue

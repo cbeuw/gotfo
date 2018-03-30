@@ -25,7 +25,7 @@ func socket(ctx context.Context, family int, ipv6only bool, addr *net.TCPAddr, d
 		return nil, os.NewSyscallError("socket", err)
 	}
 
-	if fd, err = newFD(s, family); err != nil {
+	if fd, err = newFD(s, family, syscall.SOCK_STREAM, "tcp"); err != nil {
 		syscall.Close(s)
 		return nil, err
 	}
@@ -36,6 +36,7 @@ func socket(ctx context.Context, family int, ipv6only bool, addr *net.TCPAddr, d
 		}
 
 		syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
+		syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
 
 		if fastOpen {
 			syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, TCP_FASTOPEN, 1)
@@ -59,13 +60,13 @@ func (fd *netFD) dial(ctx context.Context, addr *net.TCPAddr, data []byte) error
 	var rsa syscall.Sockaddr
 	raddr := tcpAddrToSockaddr(addr)
 
-	if err := fd.connect(ctx, raddr, data); err != nil {
+	if _, err := fd.connect(ctx, raddr, nil, data); err != nil {
 		return err
 	}
 	fd.isConnected = true
 
-	lsa, _ = syscall.Getsockname(fd.sysfd)
-	if rsa, _ = syscall.Getpeername(fd.sysfd); rsa != nil {
+	lsa, _ = syscall.Getsockname(fd.pfd.Sysfd)
+	if rsa, _ = syscall.Getpeername(fd.pfd.Sysfd); rsa != nil {
 		fd.setAddr(sockaddrToTCPAddr(lsa), sockaddrToTCPAddr(rsa))
 	} else {
 		fd.setAddr(sockaddrToTCPAddr(lsa), addr)
@@ -77,11 +78,11 @@ func (fd *netFD) listen(addr *net.TCPAddr) error {
 	laddr := &syscall.SockaddrInet4{Port: addr.Port}
 	copy(laddr.Addr[:], addr.IP.To4())
 
-	if err := syscall.Bind(fd.sysfd, laddr); err != nil {
+	if err := syscall.Bind(fd.pfd.Sysfd, laddr); err != nil {
 		return os.NewSyscallError("bind", err)
 	}
 
-	if err := syscall.Listen(fd.sysfd, syscall.SOMAXCONN); err != nil {
+	if err := syscall.Listen(fd.pfd.Sysfd, syscall.SOMAXCONN); err != nil {
 		return os.NewSyscallError("listen", err)
 	}
 	if err := fd.init(); err != nil {
